@@ -1,0 +1,827 @@
+from flask import Flask, render_template, request, session, redirect, url_for, jsonify
+import uuid
+from datetime import datetime
+from blockchain import verify_ubi_and_login, check_active_session, get_user_session_logs, end_user_session
+from learn_and_earn.learn_and_earn import init_learn_and_earn, get_random_questions, calculate_score, check_user_eligibility
+from learn_and_earn.blockchain import disburse_rewards
+from web_3 import init_web_3
+from web3 import Web3
+import os
+import logging
+import asyncio
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Blockchain configuration for wallet balance checking
+CELO_RPC_URL = os.getenv('CELO_RPC_URL', 'https://forno.celo.org') # Default to Celo's public RPC
+# Use the same contract address from blockchain.py
+GOODDOLLAR_CONTRACT_ADDRESS = os.getenv('GOODDOLLAR_CONTRACT', '0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A')
+
+# Initialize Web3 and contract connection
+w3 = None
+gooddollar_contract = None
+
+def initialize_blockchain():
+    global w3, gooddollar_contract
+    try:
+        w3 = Web3(Web3.HTTPProvider(CELO_RPC_URL))
+        if not w3.is_connected():
+            logger.error("❌ Failed to connect to Celo network")
+            return False
+
+        logger.info(f"✅ Connected to Celo network: {CELO_RPC_URL}")
+
+        if not GOODDOLLAR_CONTRACT_ADDRESS:
+            logger.error("❌ GOODDOLLAR_CONTRACT not set")
+            return False
+
+        # GoodDollar ERC20 Contract ABI for balance checking
+        contract_abi = [
+            {
+                "constant": True,
+                "inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "balance", "type": "uint256"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"name": "decimals", "type": "uint8"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "name",
+                "outputs": [{"name": "name", "type": "string"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "symbol",
+                "outputs": [{"name": "symbol", "type": "string"}],
+                "payable": False,
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+
+        gooddollar_contract = w3.eth.contract(
+            address=w3.to_checksum_address(GOODDOLLAR_CONTRACT_ADDRESS),
+            abi=contract_abi
+        )
+
+        logger.info(f"✅ GoodDollar contract loaded: {GOODDOLLAR_CONTRACT_ADDRESS}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error initializing blockchain: {e}")
+        return False
+
+# Initialize the blockchain connection when the app starts
+if not initialize_blockchain():
+    logger.warning("Blockchain initialization failed. Wallet balance features might not work.")
+
+# Blockchain Service Class
+class BlockchainService:
+    def __init__(self, w3_instance, contract_instance):
+        self.w3 = w3_instance
+        self.gooddollar_contract = contract_instance
+
+    async def get_g_balance(self, wallet_address):
+        """Get G$ balance for a wallet address"""
+        if not self.gooddollar_contract or not self.w3:
+            logger.error("❌ Blockchain service not initialized properly.")
+            return {
+                'success': False,
+                'balance': 0.0,
+                'error': 'Blockchain service not initialized'
+            }
+
+        try:
+            if not self.w3.is_connected():
+                logger.error("❌ Not connected to blockchain network")
+                return {
+                    'success': False,
+                    'balance': 0.0,
+                    'error': 'Network connection failed'
+                }
+
+            checksum_address = self.w3.to_checksum_address(wallet_address)
+            logger.info(f"🔍 Checking balance for: {checksum_address}")
+
+            # Get balance in wei
+            balance_wei = self.gooddollar_contract.functions.balanceOf(checksum_address).call()
+
+            # Get decimals (should be 18 for GoodDollar)
+            decimals = self.gooddollar_contract.functions.decimals().call()
+
+            # Convert to human readable format
+            balance = balance_wei / (10 ** decimals)
+
+            logger.info(f"💰 Balance found: {balance} G$ (wei: {balance_wei}, decimals: {decimals})")
+
+            return {
+                'success': True,
+                'balance': balance,
+                'balance_wei': balance_wei,
+                'decimals': decimals,
+                'wallet_address': wallet_address,
+                'contract': GOODDOLLAR_CONTRACT_ADDRESS,
+                'network': f"Celo ({os.getenv('CHAIN_ID', 42220)})"
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Balance check error for {wallet_address}: {e}")
+            return {
+                'success': False,
+                'balance': 0.0,
+                'error': str(e)
+            }
+
+# Instantiate the blockchain service
+# Note: In a real app, you'd manage this instance more robustly, perhaps using Flask's app context
+blockchain_service = BlockchainService(w3, gooddollar_contract)
+app.blockchain_service = blockchain_service # Attach to app for access in routes
+
+# Initialize Web3 system
+print("🎁 Initializing Web3 system...")
+init_web_3(app)
+print("✅ Web3 system initialized")
+
+# Initialize Learn & Earn system
+print("🎓 Initializing Learn & Earn system...")
+init_learn_and_earn(app)
+print("✅ Learn & Earn system initialized")
+
+# Initialize GoodMarket system
+print("🛒 Initializing GoodMarket system...")
+from goodmarket.routes import goodmarket_bp
+app.register_blueprint(goodmarket_bp)
+print("✅ GoodMarket system initialized")
+
+
+
+
+
+
+@app.route('/')
+def home():
+    return render_template('login.html')
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    wallet_address = data.get('wallet_address') if data else None
+
+    if not wallet_address:
+        return jsonify({
+            'success': False,
+            'message': 'Wallet address is required'
+        })
+
+    # Verify UBI and create session log
+    login_result = verify_ubi_and_login(wallet_address)
+
+    if login_result['success']:
+        # Store session info
+        session['wallet_address'] = wallet_address.lower()
+        session['session_id'] = login_result['session_id']
+        session['login_method'] = 'ubi_verification_with_session_log'
+        session['ubi_verified'] = login_result['ubi_verified']
+
+        return jsonify({
+            'success': True,
+            'message': login_result['message'],
+            'wallet_address': wallet_address.lower(),
+            'ubi_verified': login_result['ubi_verified'],
+            'login_method': 'ubi_verification_with_session_log',
+            'redirect_url': '/overview'
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'message': login_result['message']
+        })
+
+@app.route('/overview')
+def overview():
+    wallet_address = session.get('wallet_address')
+    session_id = session.get('session_id')
+
+    if not wallet_address or not session_id:
+        return redirect(url_for('home'))
+
+    return render_template('overview.html',
+                         wallet_address=wallet_address,
+                         ubi_verified=session.get('ubi_verified', False))
+
+@app.route('/dashboard')
+def dashboard():
+    wallet_address = session.get('wallet_address')
+    session_id = session.get('session_id')
+
+    if not wallet_address or not session_id:
+        return redirect(url_for('home'))
+
+    return render_template('dashboard.html', wallet_address=wallet_address)
+
+@app.route('/analytics')
+def analytics_dashboard():
+    """Dedicated analytics dashboard page"""
+    wallet_address = session.get('wallet_address')
+    session_id = session.get('session_id')
+
+    if not wallet_address or not session_id:
+        return redirect(url_for('home'))
+
+    return render_template('analytics.html', wallet_address=wallet_address)
+
+# Wallet Balance Check Endpoint
+@app.route('/api/wallet/check', methods=['GET'])
+def check_wallet_balance():
+    """Check wallet balance"""
+    try:
+        if 'wallet_address' not in session:
+            return jsonify({'error': 'Not authenticated'}), 401
+
+        wallet_address = session['wallet_address']
+        logger.info(f"💰 Balance check requested for: {wallet_address}")
+
+        # Check if blockchain service is ready
+        if not hasattr(app, 'blockchain_service') or not app.blockchain_service.w3:
+            logger.error("❌ Blockchain service not available for balance check.")
+            return jsonify({
+                'success': False,
+                'error': 'Blockchain service unavailable',
+                'balance': 0.0
+            }), 503
+
+        # Run the async get_g_balance method
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                app.blockchain_service.get_g_balance(wallet_address)
+            )
+
+            if result['success']:
+                # Mask wallet address for display
+                masked_address = f"{wallet_address[:6]}...{wallet_address[-6:]}"
+
+                return jsonify({
+                    'success': True,
+                    'balance': result['balance'],
+                    'balance_wei': result.get('balance_wei'),
+                    'decimals': result.get('decimals'),
+                    'wallet_address': wallet_address,
+                    'masked_address': masked_address,
+                    'contract': result.get('contract'),
+                    'network': result.get('network')
+                }), 200
+            else:
+                logger.error(f"❌ Balance check failed: {result.get('error')}")
+                return jsonify({
+                    'success': False,
+                    'error': result.get('error', 'Unknown error'),
+                    'balance': 0.0
+                }), 500
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Wallet balance check error: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to check wallet balance: {str(e)}',
+            'balance': 0.0
+        }), 500
+
+# Learn & Earn is now fully integrated via the learn_and_earn module
+# No separate routes needed - everything handled through /learn-earn/ endpoints
+
+
+
+@app.route('/api/learn-earn-status')
+def api_learn_earn_status():
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Import the quiz manager
+        from learn_and_earn.learn_and_earn import quiz_manager
+
+        # Use async wrapper for sync route
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            eligibility_info = loop.run_until_complete(
+                quiz_manager.check_quiz_eligibility(wallet_address)
+            )
+        finally:
+            loop.close()
+
+        return jsonify({
+            'success': True,
+            'eligible': eligibility_info.get('eligible', False),
+            'blocked': eligibility_info.get('blocked', False),
+            'message': eligibility_info.get('message'),
+            'next_quiz_time': eligibility_info.get('next_quiz_time'),
+            'cooldown_hours': 24
+        })
+
+    except Exception as e:
+        logger.error(f"Error checking Learn & Earn status: {e}")
+        return jsonify({
+            'success': False,
+            'eligible': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/merchant-info')
+def get_merchant_info():
+    """Get merchant information for payment instructions"""
+    try:
+        merchant_address = os.getenv('MERCHANT_ADDRESS')
+        if not merchant_address:
+            return jsonify({
+                'success': False,
+                'error': 'Merchant address not configured'
+            }), 500
+
+        return jsonify({
+            'success': True,
+            'merchant_address': merchant_address,
+            'network': 'Celo Mainnet',
+            'token': 'GoodDollar (G$)'
+        })
+    except Exception as e:
+        logger.error(f"❌ Error getting merchant info: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/learn-earn-logs')
+def get_learn_earn_logs():
+    """Get user's Learn & Earn quiz logs"""
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Import the quiz manager
+        from learn_and_earn.learn_and_earn import quiz_manager
+
+        # Get quiz history using the quiz manager
+        history = quiz_manager.get_quiz_history(wallet_address, 10)
+
+        # Calculate stats if history exists
+        total_quizzes = len(history)
+        total_rewards = sum(quiz.get('amount_g$', 0) for quiz in history)
+
+        if total_quizzes > 0:
+            average_score = sum(quiz.get('score', 0) / quiz.get('total_questions', 1) for quiz in history) / total_quizzes * 100
+        else:
+            average_score = 0
+
+        return jsonify({
+            'success': True,
+            'logs': history,
+            'quiz_history': history,  # For compatibility
+            'stats': {
+                'total_quizzes_completed': total_quizzes,
+                'total_g_earned': total_rewards,
+                'average_score_percentage': round(average_score, 1)
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting Learn & Earn logs: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'logs': []
+        }), 500
+
+
+# --- Web3 API Endpoints ---
+
+# Endpoint to check eligibility for the web_3 bonus
+@app.route('/api/hour-bonus/status', methods=['GET'])
+def api_web_3_bonus_status():
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Import the web_3 bonus service
+        from web_3.hour_bonus import hourly_bonus_service
+
+        # Check eligibility using async wrapper
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            eligibility = loop.run_until_complete(
+                hourly_bonus_service.check_bonus_eligibility(wallet_address)
+            )
+            return jsonify(eligibility), 200
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error checking web_3 bonus status: {e}")
+        return jsonify({
+            'eligible': False,
+            'blocked': True,
+            'error': str(e),
+            'message': 'Bonus system temporarily unavailable'
+        }), 500
+
+# Endpoint to claim the web_3 bonus
+@app.route('/api/hour-bonus/claim', methods=['POST'])
+def api_claim_web_3_bonus():
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Import the web_3 bonus service
+        from web_3.hour_bonus import hourly_bonus_service
+
+        # Claim bonus using async wrapper
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                hourly_bonus_service.claim_bonus(wallet_address)
+            )
+
+            if result.get('success'):
+                return jsonify(result), 200
+            else:
+                return jsonify(result), 400
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error claiming web_3 bonus: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Bonus claim failed'
+        }), 500
+
+@app.route('/api/topup-history')
+def get_topup_history():
+    """Get user's mobile top-up history"""
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        limit = request.args.get('limit', 10, type=int)
+
+        # Get top-up orders from Supabase
+        from supabase_client import get_supabase_client
+        supabase = get_supabase_client()
+
+        # Fetch user's orders
+        result = supabase.table('topup_orders')\
+            .select('*')\
+            .eq('user_address', wallet_address.lower())\
+            .order('created_at', desc=True)\
+            .limit(limit)\
+            .execute()
+
+        orders = result.data if result.data else []
+
+        # Calculate stats
+        total_orders = len(orders)
+        completed_orders = len([order for order in orders if order.get('status') == 'completed'])
+        total_g_spent = sum(float(order.get('amount_g', 0)) for order in orders if order.get('status') == 'completed')
+
+        return jsonify({
+            'success': True,
+            'history': orders,
+            'stats': {
+                'total_orders': total_orders,
+                'completed_orders': completed_orders,
+                'total_g_spent': round(total_g_spent, 2)
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error getting top-up history: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'history': []
+        }), 500
+
+@app.route('/api/cancel-order', methods=['POST'])
+def cancel_order():
+    """Cancel a topup order"""
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Get JSON data from request
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid JSON data'
+            }), 400
+
+        order_id = data.get('order_id')
+        cancel_reason = data.get('cancel_reason', 'User cancelled')
+
+        if not order_id:
+            return jsonify({
+                'success': False,
+                'error': 'Order ID is required'
+            }), 400
+
+        # Use Supabase to cancel the order using the database function
+        from supabase_client import get_supabase_client
+        supabase = get_supabase_client()
+
+        # Call the cancel_topup_order function
+        result = supabase.rpc('cancel_topup_order', {
+            'p_order_id': order_id,
+            'p_user_address': wallet_address.lower(),
+            'p_cancel_reason': cancel_reason
+        }).execute()
+
+        # Debug: Log the raw result
+        logger.info(f"🔍 Raw Supabase result: {result}")
+        logger.info(f"🔍 Result data: {result.data}")
+        logger.info(f"🔍 Result data type: {type(result.data)}")
+
+        if result.data is not None:
+            response_data = result.data
+
+            # Supabase RPC returns the JSON object directly as data
+            if isinstance(response_data, dict) and response_data.get('success'):
+                logger.info(f"✅ Order cancelled successfully: {order_id}")
+                return jsonify({
+                    'success': True,
+                    'message': 'Order cancelled successfully',
+                    'order_id': order_id,
+                    'cancelled_at': response_data.get('cancelled_at')
+                })
+            elif isinstance(response_data, dict) and not response_data.get('success'):
+                logger.error(f"❌ Cancel failed: {response_data.get('error')}")
+                return jsonify({
+                    'success': False,
+                    'error': response_data.get('error')
+                }), 400
+            else:
+                # Log the exact response for debugging
+                logger.error(f"❌ Unexpected response: {response_data}")
+                return jsonify({
+                    'success': False,
+                    'error': f'Unexpected response from database: {response_data}'
+                }), 500
+        else:
+            logger.error(f"❌ No response from cancel function")
+            return jsonify({
+                'success': False,
+                'error': 'No response from database function'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"❌ Error cancelling order: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to cancel order: {str(e)}'
+        }), 500
+
+# === ANALYTICS API ENDPOINTS ===
+
+@app.route('/api/analytics/overview')
+def get_analytics_overview():
+    """Get comprehensive analytics overview for current user"""
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        from analytics_service import analytics_service
+
+        # Get comprehensive analytics
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            analytics = loop.run_until_complete(
+                analytics_service.get_comprehensive_analytics(wallet_address)
+            )
+
+            return jsonify({
+                'success': True,
+                'analytics': analytics
+            })
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting analytics overview: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/analytics/real-time')
+def get_real_time_analytics():
+    """Get real-time system metrics"""
+    try:
+        from analytics_service import analytics_service
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            metrics = loop.run_until_complete(
+                analytics_service.get_real_time_metrics()
+            )
+
+            return jsonify({
+                'success': True,
+                'metrics': metrics
+            })
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting real-time analytics: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/analytics/topup')
+def get_topup_analytics():
+    """Get detailed top-up analytics"""
+    wallet_address = session.get('wallet_address')
+
+    try:
+        from analytics_service import analytics_service
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            analytics = loop.run_until_complete(
+                analytics_service._get_topup_analytics(wallet_address)
+            )
+
+            return jsonify({
+                'success': True,
+                'analytics': analytics
+            })
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting topup analytics: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/analytics/learn-earn')
+def get_learn_earn_analytics():
+    """Get detailed Learn & Earn analytics"""
+    wallet_address = session.get('wallet_address')
+
+    try:
+        from analytics_service import analytics_service
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            analytics = loop.run_until_complete(
+                analytics_service._get_learn_earn_analytics(wallet_address)
+            )
+
+            return jsonify({
+                'success': True,
+                'analytics': analytics
+            })
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting learn earn analytics: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/analytics/hour-bonus')
+def get_web_3_bonus_analytics():
+    """Get detailed web_3 bonus analytics"""
+    wallet_address = session.get('wallet_address')
+
+    try:
+        from analytics_service import analytics_service
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            analytics = loop.run_until_complete(
+                analytics_service._get_web_3_bonus_analytics(wallet_address)
+            )
+
+            return jsonify({
+                'success': True,
+                'analytics': analytics
+            })
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting web_3 bonus analytics: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Endpoint to view the history of claimed web_3 bonuses
+@app.route('/api/hour-bonus/history', methods=['GET'])
+def api_web_3_bonus_history():
+    wallet_address = session.get('wallet_address')
+    if not wallet_address:
+        return jsonify({'error': 'Not logged in'}), 401
+
+    try:
+        # Import the web_3 bonus service
+        from web_3.hour_bonus import hourly_bonus_service
+
+        # Get history using async wrapper
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            limit = request.args.get('limit', 10, type=int)
+            history = loop.run_until_complete(
+                hourly_bonus_service.get_user_bonus_history(wallet_address, limit)
+            )
+
+            return jsonify({
+                'success': True,
+                'history': history
+            }), 200
+
+        finally:
+            loop.close()
+
+    except Exception as e:
+        logger.error(f"❌ Error getting web_3 bonus history: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'history': []
+        }), 500
+
+
+
+
+@app.route('/logout')
+def logout():
+    # Log session end before clearing
+    if session.get('wallet_address') and session.get('session_id'):
+        try:
+            end_user_session(session.get('wallet_address'), session.get('session_id'))
+        except Exception as e:
+            logger.error(f"Error ending user session: {e}")
+
+    session.clear()
+    return redirect(url_for('home'))
+
+if __name__ == '__main__':
+    # Use debug=False for production deployment
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(host='0.0.0.0', port=5000, debug=debug_mode)
